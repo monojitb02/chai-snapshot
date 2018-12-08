@@ -1,74 +1,44 @@
 const fs = require('fs');
 const path = require('path');
 
-const seperator = process.env.CHAI_SNAPSHOT_PRETTY ? '>==>>': ' > ';
-const foldJson = (flatened) => {
-    const folded = {};
-    const buildMap = (keys, value, head) => {
-        let key = keys.shift()
-        if (!head) {
-            head = folded;
-        }
-        if (!keys.length) {
-            return head[key] = value;
-        }
-        if (!head[key]) {
-            head[key] = {}
-        }
-        return buildMap(keys, value, head[key]);
-    };
-    for (flatKey in flatened) {
-        let keys = flatKey.split(seperator);
-        buildMap(keys, flatened[flatKey]);
+const fileCache = {};
+const readSnap = (file, name) => {
+    if (fileCache[file] === undefined) {
+        fileCache[file] = fs.existsSync(file) ? require(file) : false;
     }
-    return folded;
-};
-
-const flatJson = (folded) => {
-    const flatened = {};
-    const flatenMap = (key, value, head) => {
-        let flatKey = `${head}${seperator}${key}`;
-        if (!head) {
-            flatKey = key;
-        }
-        if (key.match(/^#[0-9]+$/g)) {
-            return flatened[flatKey] = value;
-        }
-        for (childKey in value) {
-            flatenMap(childKey, value[childKey], flatKey);
-        }
-        return;
-    };
-    for (key in folded) {
-        flatenMap(key, folded[key]);
+    if (!fileCache[file] || !(name in fileCache[file])) {
+        throw `Snapshot does not exists`;
     }
-    return flatened;
+    return fileCache[file][name];
 }
-const readJson = (file) => {
-    if (!fs.existsSync(file)) {
-        return undefined;
-    }
-    try {
-        if (process.env.CHAI_SNAPSHOT_PRETTY) {
-            return flatJson(JSON.parse(fs.readFileSync(file, { flag: "r", encoding: "utf8" })));
-        }
-        return JSON.parse(fs.readFileSync(file, { flag: "r", encoding: "utf8" }));
-    } catch (err) {
-        return undefined;
-    }
-}
-const writeJson = (file, data) => {
+const writeSnap = (file, name, data) => {
+    let snap;
     if (!fs.existsSync(path.dirname(file))) {
         fs.mkdirSync(path.dirname(file));
     }
-    if (process.env.CHAI_SNAPSHOT_PRETTY) {
-        return fs.writeFileSync(file, JSON.stringify(foldJson(data), null, "  "), {
+    const snapShotCountsBefore = fileCache[file] ? Object.keys(fileCache[file]).length : 0;
+
+    if (snapShotCountsBefore === 0) {
+        fileCache[file] = { [name]: data };
+    } else {
+        fileCache[file][name] = data;
+    }
+    const snapShotCountsAfter = Object.keys(fileCache[file]).length;
+    if (snapShotCountsBefore === 0 || snapShotCountsBefore !== snapShotCountsAfter) {
+        snap = `exports[\`${name}\`] = ${JSON.stringify(data, null, "  ")};\n`
+        fs.appendFileSync(file, snap, {
             encoding: "utf8",
         });
+        return true;
     }
-    return fs.writeFileSync(file, JSON.stringify(data, null, "  "), {
+    snap = '';
+    for (let snapshot in fileCache[file]) {
+        snap = `${snap}exports[\`${snapshot}\`] = ${JSON.stringify(fileCache[file][snapshot], null, "  ")};\n`
+    };
+    fs.writeFileSync(file, snap, {
         encoding: "utf8",
     });
+    return true;
 }
 
 module.exports = function (chai, utils) {
@@ -82,11 +52,11 @@ module.exports = function (chai, utils) {
         const context = passedContext.test ? passedContext.test : passedContext
         const dir = path.dirname(context.file);
         const filename = path.basename(context.file);
-        const snapshotFile = path.join(dir, "__snapshots__", filename + ".json");
+        const snapshotFile = path.join(dir, "__snapshots__", filename + ".snap.js");
 
         const prepareTitle = (chain) => {
             if (chain.parent && chain.parent.file && path.basename(chain.parent.file) === filename) {
-                return `${prepareTitle(chain.parent)}${seperator}${chain.title}`;
+                return `${prepareTitle(chain.parent)} : ${chain.title}`;
             }
             return chain.title;
         };
@@ -95,21 +65,20 @@ module.exports = function (chai, utils) {
             context.matchSequence = 1;
         }
 
-        const name = `${prepareTitle(context)}${seperator}#${context.matchSequence++}`;
-        let snaps;
-        let expected;
-        snaps = readJson(snapshotFile);
-
-        if (snaps === undefined) {
-            writeJson(snapshotFile, { [name]: actual });
-            expected = actual;
-        } else if (snaps[name] === undefined || isForced) {
-            writeJson(snapshotFile, { ...snaps, [name]: actual });
-            expected = actual;
-        } else {
-            expected = snaps[name]
+        const name = `${prepareTitle(context)} ${context.matchSequence++}`;
+        let expected
+        try {
+            expected = readSnap(snapshotFile, name);
+        } catch (e) {
+            if (!isForced) {
+                throw e
+            }
         }
-
+        if(isForced){
+            writeSnap(snapshotFile, name, actual);
+            expected = actual;
+        }
+        
         if (actual !== null && typeof actual === "object") {
             chai.assert.deepEqual(actual, expected);
         } else {
